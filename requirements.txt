@@ -1,0 +1,11 @@
+opencv-python==5.0.0.93
+numpy
+streamlit
+pillow
+torch
+torchvision
+torchxrayvision
+scikit-image
+plotly
+pytest
+reportlab

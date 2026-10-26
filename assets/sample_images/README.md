@@ -1,0 +1,1 @@
+Place only appropriately licensed, non-identifiable sample X-ray images here. Do not commit patient images or data without proper authorization and licensing. The repository does not include sample medical images.
