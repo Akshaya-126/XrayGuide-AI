@@ -160,7 +160,7 @@ For deployment, configure the bucket name, region, and required permissions secu
 
 Watch the XrayGuide AI demonstration to see the application workflow, image processing, AI-assisted analysis, visualization, PDF report generation, and AWS integration.
 
-**YouTube Demo:** [Watch the XrayGuide AI Demo](PASTE_YOUR_YOUTUBE_VIDEO_URL_HERE)
+**YouTube Demo:** [Watch the XrayGuide AI Demo](https://youtu.be/6WCkuLyv-ps)
 
 ## Project Links
 
