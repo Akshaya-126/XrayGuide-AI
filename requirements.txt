@@ -9,8 +9,4 @@ scikit-image
 plotly
 pytest
 reportlab
-<<<<<<< HEAD
 boto3
-=======
-boto3
->>>>>>> 4ec395b (Add S3 storage and image measurements to PDF report)
