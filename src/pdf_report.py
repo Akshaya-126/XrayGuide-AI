@@ -1,8 +1,8 @@
 
 import io
-import os
 from xml.sax.saxutils import escape
 
+import cv2
 import numpy as np
 from PIL import Image as PILImage
 
@@ -19,7 +19,6 @@ from reportlab.platypus import (
     PageBreak,
     Table,
     TableStyle,
-    KeepTogether,
 )
 
 
@@ -69,11 +68,8 @@ CLINIC_GUIDANCE_FALLBACK = (
 # --------------------------------------------------
 
 def _normalise_image(image):
-    """
-    Convert an image array into a valid RGB uint8 array.
+    """Convert grayscale, RGB or RGBA image arrays to RGB uint8."""
 
-    Supports grayscale, RGB, and RGBA images.
-    """
     if image is None:
         raise ValueError("An image required for the report is missing.")
 
@@ -90,11 +86,12 @@ def _normalise_image(image):
             array = np.repeat(array, 3, axis=2)
 
         elif array.shape[2] == 4:
-            # Composite transparency onto a white background.
             rgba = PILImage.fromarray(
-                np.asarray(array, dtype=np.uint8),
-                mode="RGBA",
+                np.asarray(array, dtype=np.uint8)
             )
+
+            rgba = rgba.convert("RGBA")
+
             background = PILImage.new(
                 "RGB",
                 rgba.size,
@@ -107,7 +104,6 @@ def _normalise_image(image):
             raise ValueError(
                 "The image must have 1, 3, or 4 channels."
             )
-
     else:
         raise ValueError(
             "Unsupported image dimensions. Expected a 2D or 3D image."
@@ -128,10 +124,10 @@ def _normalise_image(image):
 
 
 def _image_to_buffer(image):
-    """Convert a NumPy image array to an in-memory PNG buffer."""
-    rgb_array = _normalise_image(image)
+    """Convert a NumPy image to an in-memory PNG buffer."""
 
-    pil_image = PILImage.fromarray(rgb_array, mode="RGB")
+    rgb_array = _normalise_image(image)
+    pil_image = PILImage.fromarray(rgb_array)
 
     buffer = io.BytesIO()
     pil_image.save(buffer, format="PNG")
@@ -141,13 +137,12 @@ def _image_to_buffer(image):
 
 
 def _make_report_image(image, max_width, max_height):
-    """
-    Create a ReportLab image while preserving its aspect ratio.
-    """
+    """Create a ReportLab image while preserving aspect ratio."""
+
     buffer = _image_to_buffer(image)
 
-    pil_image = PILImage.open(buffer)
-    image_width, image_height = pil_image.size
+    with PILImage.open(buffer) as pil_image:
+        image_width, image_height = pil_image.size
 
     scale = min(
         max_width / image_width,
@@ -159,20 +154,77 @@ def _make_report_image(image, max_width, max_height):
         width=image_width * scale,
         height=image_height * scale,
     )
-
     report_image.hAlign = "CENTER"
 
     return report_image, buffer
 
 
+def _calculate_measurements(image, file_size_bytes=None):
+    """
+    Calculate image dimensions and grayscale pixel statistics.
+
+    These measurements describe the image, not anatomy or disease.
+    """
+
+    array = _normalise_image(image)
+
+    grayscale = cv2.cvtColor(
+        array,
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    height, width = grayscale.shape
+
+    mean_intensity = float(np.mean(grayscale))
+    std_intensity = float(np.std(grayscale))
+
+    percentile_5, percentile_95 = np.percentile(
+        grayscale,
+        [5, 95],
+    )
+
+    contrast_range = float(percentile_95 - percentile_5)
+
+    measurements = [
+        ("Image width", f"{width:,} px"),
+        ("Image height", f"{height:,} px"),
+    ]
+
+    if file_size_bytes is not None:
+        if file_size_bytes >= 1024 * 1024:
+            size_text = (
+                f"{file_size_bytes / (1024 * 1024):.2f} MB"
+            )
+        else:
+            size_text = f"{file_size_bytes / 1024:.2f} KB"
+
+        measurements.append(("Original file size", size_text))
+
+    measurements.extend([
+        (
+            "Mean grayscale intensity",
+            f"{mean_intensity:.2f} / 255",
+        ),
+        (
+            "Grayscale standard deviation",
+            f"{std_intensity:.2f}",
+        ),
+        (
+            "Contrast estimate (P95 - P5)",
+            f"{contrast_range:.2f} / 255",
+        ),
+    ])
+
+    return measurements
+
+
 # --------------------------------------------------
-# TEXT HELPERS
+# TEXT AND TABLE HELPERS
 # --------------------------------------------------
 
 def _safe_text(value, fallback="Not provided"):
-    """
-    Safely convert text into escaped XML for ReportLab Paragraphs.
-    """
+    """Escape text for ReportLab Paragraphs."""
+
     if value is None:
         value = fallback
 
@@ -184,8 +236,89 @@ def _safe_text(value, fallback="Not provided"):
     return escape(text).replace("\n", "<br/>")
 
 
+def _measurement_table(measurements, styles):
+    """Build a formatted table containing image measurements."""
+
+    rows = [
+        [
+            Paragraph("<b>Measurement</b>", styles["TableText"]),
+            Paragraph("<b>Value</b>", styles["TableText"]),
+        ]
+    ]
+
+    for label, value in measurements:
+        rows.append([
+            Paragraph(_safe_text(label), styles["TableText"]),
+            Paragraph(_safe_text(value), styles["TableText"]),
+        ])
+
+    table = Table(
+        rows,
+        colWidths=[82 * mm, 83 * mm],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
+    table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#E7EEF5"),
+            ),
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, -1),
+                colors.HexColor("#263445"),
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.4,
+                colors.HexColor("#D8E1EA"),
+            ),
+            (
+                "VALIGN",
+                (0, 0),
+                (-1, -1),
+                "TOP",
+            ),
+            (
+                "LEFTPADDING",
+                (0, 0),
+                (-1, -1),
+                7,
+            ),
+            (
+                "RIGHTPADDING",
+                (0, 0),
+                (-1, -1),
+                7,
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                5,
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                5,
+            ),
+        ])
+    )
+
+    return table
+
+
 def _get_styles():
-    """Create the PDF typography styles."""
+    """Create PDF typography styles."""
+
     styles = getSampleStyleSheet()
 
     styles.add(
@@ -233,11 +366,22 @@ def _get_styles():
             name="BodyTextCustom",
             parent=styles["BodyText"],
             fontName="Helvetica",
-            fontSize=9.5,
-            leading=14,
+            fontSize=9,
+            leading=13,
             alignment=TA_LEFT,
             textColor=colors.HexColor("#263445"),
             spaceAfter=7,
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="TableText",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=11,
+            textColor=colors.HexColor("#263445"),
         )
     )
 
@@ -251,7 +395,7 @@ def _get_styles():
             alignment=TA_CENTER,
             textColor=colors.HexColor("#526579"),
             spaceBefore=4,
-            spaceAfter=10,
+            spaceAfter=8,
         )
     )
 
@@ -263,6 +407,7 @@ def _get_styles():
             fontSize=9,
             leading=13,
             textColor=colors.HexColor("#8A2C20"),
+            spaceAfter=7,
         )
     )
 
@@ -286,11 +431,11 @@ def _get_styles():
 
 def _draw_page_elements(canvas, document):
     """Draw a consistent header and footer on every PDF page."""
+
     canvas.saveState()
 
     page_width, page_height = A4
 
-    # Header line
     canvas.setStrokeColor(colors.HexColor("#D8E1EA"))
     canvas.setLineWidth(0.6)
 
@@ -310,7 +455,6 @@ def _draw_page_elements(canvas, document):
         REPORT_TITLE,
     )
 
-    # Footer line
     canvas.line(
         document.leftMargin,
         13 * mm,
@@ -348,42 +492,19 @@ def build_visual_pdf(
     selected_label=None,
 ):
     """
-    Build an XrayGuide AI PDF report and return its bytes.
+    Build a PDF report and return its bytes.
 
-    Parameters
-    ----------
-    original_rgb : numpy.ndarray
-        Original chest X-ray in RGB format.
-
-    enhanced_rgb : numpy.ndarray
-        Contrast-enhanced X-ray in RGB or grayscale format.
-
-    overlay_rgb : numpy.ndarray
-        Grad-CAM overlay blended with the original X-ray.
-
-    explanation : dict
-        Output returned by generate_explanation().
-
-    selected_label : str, optional
-        Display name of the highest-ranked model finding.
-
-    Returns
-    -------
-    bytes
-        Complete PDF document as bytes, ready for Streamlit download.
+    The explanation context can include workflow and Grad-CAM details.
+    The image measurements are calculated directly from the image arrays.
     """
-    if not isinstance(explanation, dict):
-        raise TypeError(
-            "explanation must be a dictionary returned by "
-            "generate_explanation()."
-        )
 
-    # Validate and prepare the image arrays.
+    if not isinstance(explanation, dict):
+        raise TypeError("explanation must be a dictionary.")
+
     original_rgb = _normalise_image(original_rgb)
     enhanced_rgb = _normalise_image(enhanced_rgb)
     overlay_rgb = _normalise_image(overlay_rgb)
 
-    # Extract explanation fields.
     display_name = (
         selected_label
         or explanation.get("display_name")
@@ -421,7 +542,20 @@ def build_visual_pdf(
         DISCLAIMER,
     )
 
-    # Prepare an in-memory PDF.
+    # Calculate measurements independently for each image.
+    # The original uploaded file size is supplied through explanation
+    # context by the app, when available.
+    original_file_size = explanation.get("original_file_size_bytes")
+
+    original_measurements = _calculate_measurements(
+        original_rgb,
+        file_size_bytes=original_file_size,
+    )
+
+    enhanced_measurements = _calculate_measurements(
+        enhanced_rgb,
+    )
+
     pdf_buffer = io.BytesIO()
 
     document = SimpleDocTemplate(
@@ -467,10 +601,10 @@ def build_visual_pdf(
         )
     )
 
-    story.append(Spacer(1, 6 * mm))
+    story.append(Spacer(1, 4 * mm))
 
     # --------------------------------------------------
-    # ORIGINAL X-RAY
+    # ORIGINAL X-RAY AND MEASUREMENTS
     # --------------------------------------------------
 
     story.append(
@@ -482,8 +616,8 @@ def build_visual_pdf(
 
     original_image, original_buffer = _make_report_image(
         original_rgb,
-        max_width=165 * mm,
-        max_height=105 * mm,
+        max_width=145 * mm,
+        max_height=85 * mm,
     )
 
     story.append(original_image)
@@ -497,11 +631,16 @@ def build_visual_pdf(
 
     story.append(
         Paragraph(
-            f"Image dimensions: {original_rgb.shape[1]} × "
-            f"{original_rgb.shape[0]} pixels.",
-            styles["BodyTextCustom"],
+            "Original X-ray measurements",
+            styles["SectionHeading"],
         )
     )
+
+    story.append(
+        _measurement_table(original_measurements, styles)
+    )
+
+    story.append(Spacer(1, 5 * mm))
 
     # --------------------------------------------------
     # MODEL FINDING
@@ -516,24 +655,12 @@ def build_visual_pdf(
 
     finding_data = [
         [
-            Paragraph(
-                "<b>Model output</b>",
-                styles["BodyTextCustom"],
-            ),
-            Paragraph(
-                _safe_text(display_name),
-                styles["BodyTextCustom"],
-            ),
+            Paragraph("<b>Model output</b>", styles["TableText"]),
+            Paragraph(_safe_text(display_name), styles["TableText"]),
         ],
         [
-            Paragraph(
-                "<b>Summary</b>",
-                styles["BodyTextCustom"],
-            ),
-            Paragraph(
-                _safe_text(summary),
-                styles["BodyTextCustom"],
-            ),
+            Paragraph("<b>Summary</b>", styles["TableText"]),
+            Paragraph(_safe_text(summary), styles["TableText"]),
         ],
     ]
 
@@ -544,66 +671,58 @@ def build_visual_pdf(
     )
 
     finding_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (0, -1),
-                    colors.HexColor("#EEF3F8"),
-                ),
-                (
-                    "TEXTCOLOR",
-                    (0, 0),
-                    (-1, -1),
-                    colors.HexColor("#263445"),
-                ),
-                (
-                    "BOX",
-                    (0, 0),
-                    (-1, -1),
-                    0.5,
-                    colors.HexColor("#D8E1EA"),
-                ),
-                (
-                    "INNERGRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.4,
-                    colors.HexColor("#D8E1EA"),
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "TOP",
-                ),
-                (
-                    "LEFTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    8,
-                ),
-                (
-                    "RIGHTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    8,
-                ),
-                (
-                    "TOPPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    7,
-                ),
-                (
-                    "BOTTOMPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    7,
-                ),
-            ]
-        )
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (0, -1),
+                colors.HexColor("#EEF3F8"),
+            ),
+            (
+                "BOX",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.HexColor("#D8E1EA"),
+            ),
+            (
+                "INNERGRID",
+                (0, 0),
+                (-1, -1),
+                0.4,
+                colors.HexColor("#D8E1EA"),
+            ),
+            (
+                "VALIGN",
+                (0, 0),
+                (-1, -1),
+                "TOP",
+            ),
+            (
+                "LEFTPADDING",
+                (0, 0),
+                (-1, -1),
+                8,
+            ),
+            (
+                "RIGHTPADDING",
+                (0, 0),
+                (-1, -1),
+                8,
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                7,
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                7,
+            ),
+        ])
     )
 
     story.append(finding_table)
@@ -646,7 +765,7 @@ def build_visual_pdf(
     )
 
     # --------------------------------------------------
-    # CONTRAST-ENHANCED IMAGE
+    # ENHANCED X-RAY AND MEASUREMENTS
     # --------------------------------------------------
 
     story.append(PageBreak())
@@ -660,8 +779,8 @@ def build_visual_pdf(
 
     enhanced_image, enhanced_buffer = _make_report_image(
         enhanced_rgb,
-        max_width=165 * mm,
-        max_height=115 * mm,
+        max_width=145 * mm,
+        max_height=80 * mm,
     )
 
     story.append(enhanced_image)
@@ -671,6 +790,17 @@ def build_visual_pdf(
             IMAGE_NOTE,
             styles["ImageCaption"],
         )
+    )
+
+    story.append(
+        Paragraph(
+            "Enhanced X-ray measurements",
+            styles["SectionHeading"],
+        )
+    )
+
+    story.append(
+        _measurement_table(enhanced_measurements, styles)
     )
 
     # --------------------------------------------------
@@ -686,8 +816,8 @@ def build_visual_pdf(
 
     overlay_image, overlay_buffer = _make_report_image(
         overlay_rgb,
-        max_width=165 * mm,
-        max_height=115 * mm,
+        max_width=145 * mm,
+        max_height=80 * mm,
     )
 
     story.append(overlay_image)
@@ -711,59 +841,55 @@ def build_visual_pdf(
     )
 
     guidance_table = Table(
-        [
-            [
-                Paragraph(
-                    _safe_text(clinic_guidance),
-                    styles["BodyTextCustom"],
-                )
-            ]
-        ],
+        [[
+            Paragraph(
+                _safe_text(clinic_guidance),
+                styles["BodyTextCustom"],
+            )
+        ]],
         colWidths=[165 * mm],
     )
 
     guidance_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (-1, -1),
-                    colors.HexColor("#EEF5FB"),
-                ),
-                (
-                    "BOX",
-                    (0, 0),
-                    (-1, -1),
-                    0.7,
-                    colors.HexColor("#A8C6DF"),
-                ),
-                (
-                    "LEFTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    9,
-                ),
-                (
-                    "RIGHTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    9,
-                ),
-                (
-                    "TOPPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    9,
-                ),
-                (
-                    "BOTTOMPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    9,
-                ),
-            ]
-        )
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, -1),
+                colors.HexColor("#EEF5FB"),
+            ),
+            (
+                "BOX",
+                (0, 0),
+                (-1, -1),
+                0.7,
+                colors.HexColor("#A8C6DF"),
+            ),
+            (
+                "LEFTPADDING",
+                (0, 0),
+                (-1, -1),
+                9,
+            ),
+            (
+                "RIGHTPADDING",
+                (0, 0),
+                (-1, -1),
+                9,
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                9,
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                9,
+            ),
+        ])
     )
 
     story.append(guidance_table)
@@ -771,7 +897,7 @@ def build_visual_pdf(
 
     story.append(
         Paragraph(
-            "<b>Emergency warning</b>",
+            "Emergency warning",
             styles["WarningText"],
         )
     )
@@ -808,9 +934,7 @@ def build_visual_pdf(
         )
     )
 
-    story.append(
-        Spacer(1, 3 * mm)
-    )
+    story.append(Spacer(1, 3 * mm))
 
     story.append(
         Paragraph(

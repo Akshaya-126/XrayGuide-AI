@@ -18,6 +18,7 @@ def get_s3_client():
 def upload_bytes(data: bytes, filename: str, content_type: str) -> str:
     """Upload bytes to the private S3 bucket and return the object key."""
     bucket = st.secrets["S3_BUCKET_NAME"]
+
     safe_name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     safe_name = safe_name.replace(" ", "_")
 

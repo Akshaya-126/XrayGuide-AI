@@ -10,6 +10,7 @@ from PIL import Image
 
 from src.agent import analyze_xray
 from src.pdf_report import build_visual_pdf
+from s3_storage import upload_bytes
 
 
 # ============================================================
@@ -50,6 +51,13 @@ st.markdown(
         margin-bottom: 0.6rem;
     }
 
+    .measurement-heading {
+        font-size: 1.05rem;
+        font-weight: 650;
+        margin-top: 0.9rem;
+        margin-bottom: 0.5rem;
+    }
+
     div[data-testid="stImage"] img {
         border-radius: 8px;
     }
@@ -80,6 +88,88 @@ st.warning(
 # ============================================================
 # IMAGE HELPERS
 # ============================================================
+
+def calculate_image_measurements(image_rgb, file_size_bytes=None):
+    """
+    Calculate basic image dimensions and pixel-intensity measurements.
+
+    These are image-processing measurements, not clinical measurements.
+    """
+
+    image_rgb = np.asarray(image_rgb)
+
+    if image_rgb.ndim == 2:
+        grayscale = image_rgb
+    elif image_rgb.ndim == 3 and image_rgb.shape[2] == 3:
+        grayscale = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    else:
+        raise ValueError(
+            "Unsupported image format for measurement calculation."
+        )
+
+    height, width = grayscale.shape[:2]
+
+    mean_intensity = float(np.mean(grayscale))
+    std_intensity = float(np.std(grayscale))
+
+    percentile_5, percentile_95 = np.percentile(
+        grayscale,
+        [5, 95],
+    )
+
+    contrast_range = float(percentile_95 - percentile_5)
+
+    measurements = [
+        ("Image width", f"{width:,} px"),
+        ("Image height", f"{height:,} px"),
+        (
+            "Mean grayscale intensity",
+            f"{mean_intensity:.2f} / 255",
+        ),
+        (
+            "Grayscale standard deviation",
+            f"{std_intensity:.2f}",
+        ),
+        (
+            "Contrast estimate (P95 - P5)",
+            f"{contrast_range:.2f} / 255",
+        ),
+    ]
+
+    if file_size_bytes is not None:
+        if file_size_bytes >= 1024 * 1024:
+            file_size = (
+                f"{file_size_bytes / (1024 * 1024):.2f} MB"
+            )
+        else:
+            file_size = f"{file_size_bytes / 1024:.2f} KB"
+
+        measurements.insert(2, ("Original file size", file_size))
+
+    return measurements
+
+
+def display_image_measurements(image_rgb, file_size_bytes=None):
+    """Display image measurements in a compact Streamlit layout."""
+
+    measurements = calculate_image_measurements(
+        image_rgb,
+        file_size_bytes=file_size_bytes,
+    )
+
+    for start in range(0, len(measurements), 2):
+        measurement_columns = st.columns(2)
+
+        for column, item in zip(
+            measurement_columns,
+            measurements[start:start + 2],
+        ):
+            label, value = item
+
+            with column:
+                st.markdown(f"**{label}**")
+                st.write(value)
+
 
 def create_gradcam_images(original_rgb, heatmap):
     """Create a Grad-CAM heatmap overlay and relative activation map."""
@@ -233,20 +323,17 @@ def analyse_uploaded_xray(original_rgb):
             enhanced_image,
             cv2.COLOR_GRAY2RGB,
         )
-    elif (
-        enhanced_image.ndim == 3
-        and enhanced_image.shape[2] == 3
-    ):
+    elif enhanced_image.ndim == 3 and enhanced_image.shape[2] == 3:
         enhanced_rgb = enhanced_image
     else:
         raise ValueError(
             "The agent returned an unsupported enhanced image format."
         )
 
-    # Grad-CAM is optional. Preserve the model result if it fails.
     overlay_rgb = None
     activation_map = None
     gradcam_error = agent_result.get("gradcam_error")
+
     influential_region = (
         "The influential region could not be estimated because "
         "the Grad-CAM visualization is unavailable."
@@ -277,7 +364,6 @@ def analyse_uploaded_xray(original_rgb):
             gradcam_error or "The Grad-CAM result is unavailable."
         )
 
-    # Keep the controller's output visible for demonstration.
     decision = agent_result.get("decision", {})
 
     if not isinstance(decision, dict):
@@ -318,19 +404,23 @@ if uploaded_file is None:
         "xray_image_key",
         "xray_error",
         "xray_traceback",
+        "xray_s3_key",
+        "xray_s3_error",
+        "xray_pdf_s3_key",
+        "xray_pdf_s3_error",
     ):
         st.session_state.pop(key, None)
 
     st.info(
-        "Upload a chest X-ray to display the image comparison, "
-        "model output, visual explanation and PDF report."
+        "Upload a chest X-ray to display image measurements, "
+        "model output, visual explanation and the PDF report."
     )
 
     st.stop()
 
 
 # ============================================================
-# RUN ANALYSIS WHEN THE UPLOADED IMAGE CHANGES
+# SAVE IMAGE TO S3 AND RUN ANALYSIS
 # ============================================================
 
 uploaded_bytes = uploaded_file.getvalue()
@@ -342,7 +432,36 @@ if st.session_state.get("xray_image_key") != image_key:
 
     st.session_state.pop("xray_error", None)
     st.session_state.pop("xray_traceback", None)
+    st.session_state.pop("xray_s3_error", None)
+    st.session_state.pop("xray_pdf_s3_error", None)
 
+    st.session_state["xray_s3_key"] = None
+    st.session_state["xray_pdf_s3_key"] = None
+
+    # Upload the original image automatically.
+    try:
+        extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
+
+        content_types = {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+        }
+
+        object_key = upload_bytes(
+            data=uploaded_bytes,
+            filename=f"xray_{image_key[:16]}.{extension}",
+            content_type=content_types[extension],
+        )
+
+        st.session_state["xray_s3_key"] = object_key
+
+    except Exception as error:
+        st.session_state["xray_s3_error"] = (
+            f"{type(error).__name__}: {error}"
+        )
+
+    # Run the existing AI analysis workflow.
     try:
         with st.spinner(
             "Running the model, OpenCV enhancement and agent workflow..."
@@ -362,13 +481,22 @@ if st.session_state.get("xray_image_key") != image_key:
         st.session_state["xray_traceback"] = traceback.format_exc()
 
 
+# Display original-image storage status only.
+if st.session_state.get("xray_s3_key"):
+    st.success("Original X-ray saved to private S3 storage.")
+elif st.session_state.get("xray_s3_error"):
+    st.warning(
+        "The original X-ray was not confirmed as saved to S3. "
+        "Analysis can still continue."
+    )
+
+
 # ============================================================
 # ERROR HANDLING
 # ============================================================
 
 if st.session_state.get("xray_error"):
     st.error("The image analysis could not be completed.")
-
     st.code(st.session_state["xray_error"])
 
     with st.expander("Technical details"):
@@ -432,13 +560,15 @@ st.caption(
 
 
 # ============================================================
-# 2. ORIGINAL AND ENHANCED IMAGES
+# 2. ORIGINAL AND ENHANCED IMAGES + MEASUREMENTS
 # ============================================================
 
 st.divider()
 
 st.markdown(
-    '<div class="section-heading">2. Image comparison</div>',
+    '<div class="section-heading">'
+    '2. Image comparison and measurements'
+    '</div>',
     unsafe_allow_html=True,
 )
 
@@ -450,17 +580,55 @@ original_column, enhanced_column = st.columns(2, gap="medium")
 
 with original_column:
     st.markdown("**Original X-ray**")
+
     st.image(
         result["original_rgb"],
         use_container_width=True,
     )
 
+    st.markdown(
+        '<div class="measurement-heading">'
+        'Original X-ray measurements'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    display_image_measurements(
+        result["original_rgb"],
+        file_size_bytes=len(uploaded_bytes),
+    )
+
 with enhanced_column:
     st.markdown("**OpenCV-enhanced X-ray**")
+
     st.image(
         result["enhanced_rgb"],
         use_container_width=True,
     )
+
+    st.markdown(
+        '<div class="measurement-heading">'
+        'Enhanced X-ray measurements'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    display_image_measurements(
+        result["enhanced_rgb"],
+    )
+
+st.caption(
+    "The original file size applies only to the uploaded file. "
+    "The enhanced image is measured in memory and does not have a separate "
+    "file size unless it is explicitly encoded or saved."
+)
+
+st.info(
+    "These measurements describe image dimensions and pixel intensity. "
+    "They are not measurements of lung size, heart size, lesions, or other "
+    "anatomical structures. Enhancement can change intensity and contrast "
+    "measurements without adding medical information."
+)
 
 st.caption(
     "Enhancement changes image appearance. It does not add medical "
@@ -491,10 +659,7 @@ if result["overlay_rgb"] is not None:
         use_container_width=True,
     )
 
-    st.markdown(
-        "**Where is the strongest relative activation?**"
-    )
-
+    st.markdown("**Where is the strongest relative activation?**")
     st.write(result["influential_region"])
 
     st.info(
@@ -516,7 +681,9 @@ else:
 st.divider()
 
 st.markdown(
-    '<div class="section-heading">4. Understanding the model output</div>',
+    '<div class="section-heading">'
+    '4. Understanding the model output'
+    '</div>',
     unsafe_allow_html=True,
 )
 
@@ -596,7 +763,7 @@ with st.expander("Limitations and safety information"):
 
 
 # ============================================================
-# 6. PDF REPORT
+# 6. PDF REPORT AND AUTOMATIC S3 STORAGE
 # ============================================================
 
 st.divider()
@@ -633,7 +800,35 @@ workflow_context = (
     f"Controller reason: {reason}"
 )
 
-additional_context = region_context + "\n\n" + workflow_context
+# Include the image measurements in the PDF explanation context too.
+original_measurement_lines = calculate_image_measurements(
+    result["original_rgb"],
+    file_size_bytes=len(uploaded_bytes),
+)
+
+enhanced_measurement_lines = calculate_image_measurements(
+    result["enhanced_rgb"],
+)
+
+measurement_context = "ORIGINAL X-RAY MEASUREMENTS:\n"
+measurement_context += "\n".join(
+    f"{label}: {value}"
+    for label, value in original_measurement_lines
+)
+
+measurement_context += "\n\nENHANCED X-RAY MEASUREMENTS:\n"
+measurement_context += "\n".join(
+    f"{label}: {value}"
+    for label, value in enhanced_measurement_lines
+)
+
+additional_context = (
+    measurement_context
+    + "\n\n"
+    + region_context
+    + "\n\n"
+    + workflow_context
+)
 
 if existing_context:
     pdf_explanation["context"] = (
@@ -642,7 +837,7 @@ if existing_context:
 else:
     pdf_explanation["context"] = additional_context
 
-# If Grad-CAM is unavailable, use the original image as a safe placeholder.
+# If Grad-CAM is unavailable, use the original image as a placeholder.
 # The report context explicitly states that Grad-CAM was unavailable.
 pdf_overlay = (
     result["overlay_rgb"]
@@ -667,7 +862,36 @@ try:
         st.error(
             "The PDF generator did not return a valid PDF file."
         )
+
     else:
+        # Automatically upload the PDF once per uploaded image in this
+        # Streamlit session. The S3 object remains private.
+        if st.session_state.get("xray_pdf_s3_key") is None:
+            try:
+                pdf_s3_key = upload_bytes(
+                    data=pdf_bytes,
+                    filename=f"xrayguide_report_{image_key[:16]}.pdf",
+                    content_type="application/pdf",
+                )
+
+                st.session_state["xray_pdf_s3_key"] = pdf_s3_key
+                st.session_state.pop("xray_pdf_s3_error", None)
+
+            except Exception as error:
+                st.session_state["xray_pdf_s3_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+
+        # Intentionally do not display a PDF-upload success message.
+        if (
+            st.session_state.get("xray_pdf_s3_key") is None
+            and st.session_state.get("xray_pdf_s3_error")
+        ):
+            st.warning(
+                "The PDF is available to download, but its upload to "
+                "S3 was not confirmed."
+            )
+
         st.download_button(
             label="Download complete XrayGuide AI report (PDF)",
             data=pdf_bytes,
