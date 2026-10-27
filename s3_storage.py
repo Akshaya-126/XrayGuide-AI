@@ -1,4 +1,3 @@
-
 import uuid
 from datetime import datetime, timezone
 
@@ -34,3 +33,25 @@ def upload_bytes(data: bytes, filename: str, content_type: str) -> str:
     )
 
     return object_key
+
+
+def list_files():
+    """List stored files from the private S3 bucket."""
+    bucket = st.secrets["S3_BUCKET_NAME"]
+    s3 = get_s3_client()
+    
+    response = s3.list_objects_v2(Bucket=bucket, MaxKeys=50)
+    files = []
+    
+    if "Contents" in response:
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            last_modified = obj["LastModified"].strftime("%Y-%m-%d %H:%M")
+            file_type = "report" if "report" in key.lower() else "image"
+            files.append({
+                "type": file_type,
+                "name": key.split("/")[-1],
+                "date": last_modified
+            })
+            
+    return files
