@@ -5,8 +5,9 @@
 2. OpenCV computes basic technical image indicators.
 3. TorchXRayVision DenseNet-121 produces outputs for the labels supported by its pretrained weights.
 4. A transparent rule-based controller selects a workflow action based on technical metrics and whether model outputs exist.
-5. The dashboard visualizes raw model outputs and offers a JSON technical summary.
-6. AWS EC2 is the planned hosting target.
+5. The dashboard visualizes raw model outputs and offers a downloadable PDF report.
+6. If enabled and configured, the original image is uploaded to private S3 storage. Generated PDFs are not uploaded.
+7. AWS EC2 is the planned hosting target.
 
 ## Components
 - `src/image_quality.py`: technical metrics; thresholds are heuristics.

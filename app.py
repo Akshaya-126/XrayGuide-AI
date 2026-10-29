@@ -1,7 +1,6 @@
 import hashlib
 import html
 import io
-import os
 import traceback
 
 import cv2
@@ -9,9 +8,10 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
+from config.settings import AUTO_S3_SYNC_DEFAULT
 from src.agent import analyze_xray
 from src.pdf_report import build_visual_pdf
-from s3_storage import upload_bytes, list_files
+from s3_storage import get_s3_bucket, get_s3_region, list_files, upload_bytes
 
 
 # ============================================================
@@ -29,7 +29,8 @@ NAV_ITEMS = ["Home", "Upload Image", "Analysis", "Report", "Settings"]
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 st.session_state.setdefault("nav", "Home")
-st.session_state.setdefault("conf_threshold", 0.3)
+st.session_state.setdefault("score_threshold", 0.3)
+st.session_state.setdefault("auto_s3_sync", AUTO_S3_SYNC_DEFAULT)
 
 
 # ============================================================
@@ -44,6 +45,12 @@ def html_block(text):
 def go_to(page):
     """Button callback: switch the sidebar navigation."""
     st.session_state["nav"] = page
+
+
+def retry_analysis():
+    """Clear the last failure while retaining the current upload and S3 object."""
+    for key in ("xray_error", "xray_traceback"):
+        st.session_state.pop(key, None)
 
 
 def keyed_container(key, **kwargs):
@@ -577,22 +584,35 @@ elif selected_page == "Upload Image":
         else:
             image_key = hashlib.sha256(uploaded_bytes).hexdigest()
 
-            if st.session_state.get("xray_image_key") != image_key:
+            is_new_image = st.session_state.get("xray_image_key") != image_key
+            if is_new_image:
                 st.session_state["xray_image_key"] = image_key
                 for stale_key in ("xray_result", "xray_error", "xray_traceback", "xray_s3_key", "xray_s3_error", "pdf_cache"):
                     st.session_state.pop(stale_key, None)
 
+            should_analyze = (
+                is_new_image
+                or (
+                    st.session_state.get("xray_result") is None
+                    and not st.session_state.get("xray_error")
+                )
+            )
+            if should_analyze:
                 extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
-                try:
-                    content_types = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
-                    object_key = upload_bytes(
-                        data=uploaded_bytes,
-                        filename=f"xray_{image_key[:16]}.{extension}",
-                        content_type=content_types[extension],
-                    )
-                    st.session_state["xray_s3_key"] = object_key
-                except Exception as error:
-                    st.session_state["xray_s3_error"] = str(error)
+                if (
+                    st.session_state.get("auto_s3_sync", True)
+                    and not st.session_state.get("xray_s3_key")
+                ):
+                    try:
+                        content_types = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
+                        object_key = upload_bytes(
+                            data=uploaded_bytes,
+                            filename=f"xray_{image_key[:16]}.{extension}",
+                            content_type=content_types[extension],
+                        )
+                        st.session_state["xray_s3_key"] = object_key
+                    except Exception as error:
+                        st.session_state["xray_s3_error"] = str(error)
 
                 try:
                     with st.spinner("Analyzing image…"):
@@ -608,15 +628,23 @@ elif selected_page == "Upload Image":
 
             if st.session_state.get("xray_error"):
                 st.error(f"Analysis failed: {st.session_state['xray_error']}")
+                st.button(
+                    "Retry analysis",
+                    type="primary",
+                    on_click=retry_analysis,
+                    key="retry_analysis",
+                )
                 with st.expander("Technical details"):
                     st.code(st.session_state.get("xray_traceback", ""))
             elif st.session_state.get("xray_result") is not None:
                 st.markdown(
-                    '<div class="xg-success">Image uploaded and analyzed successfully.</div>',
+                    '<div class="xg-success">Image analyzed successfully.</div>',
                     unsafe_allow_html=True,
                 )
                 if st.session_state.get("xray_s3_error"):
                     st.warning("The image was analyzed, but it could not be saved to cloud storage.")
+                elif not st.session_state.get("xray_s3_key"):
+                    st.info("Automatic S3 image sync is off; this image was not uploaded.")
                 st.button("View Analysis", type="primary", on_click=go_to, args=("Analysis",), key="view_analysis")
 
 
@@ -653,13 +681,16 @@ elif selected_page == "Analysis":
         # ---------- AI-Assisted Findings ----------
         with tab_find:
             page_header("AI Analysis & Findings")
-            threshold = float(st.session_state.get("conf_threshold", 0.3))
+            threshold = float(st.session_state.get("score_threshold", 0.3))
             st.markdown(
                 f'<div class="meta-row"><span class="badge-blue">Model: TorchXRayVision (Pretrained)</span>'
-                f'<span class="meta-thr">Confidence Threshold: {threshold:g}</span></div>',
+                f'<span class="meta-thr">Raw score display threshold: {threshold:g}</span></div>',
                 unsafe_allow_html=True,
             )
-            st.markdown('<div class="xg-h3">Top Findings (Ranked)</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="xg-h3">Top Model Outputs (raw scores, not probabilities)</div>',
+                unsafe_allow_html=True,
+            )
 
             predictions = result.get("predictions", {})
             ranked = sorted(predictions.items(), key=lambda item: float(item[1]), reverse=True)[:5]
@@ -676,7 +707,7 @@ elif selected_page == "Analysis":
                         f'<div class="bar"><i class="{low}" style="width:{width:.0f}%"></i></div></div>',
                     ]
                 )
-            st.markdown(html_table(["Rank", "Finding", "Confidence"], rows), unsafe_allow_html=True)
+            st.markdown(html_table(["Rank", "Model label", "Raw model score"], rows), unsafe_allow_html=True)
 
             explanation = result.get("explanation", {})
             if explanation.get("display_name") or explanation.get("summary"):
@@ -738,7 +769,7 @@ elif selected_page == "Report":
         else:
             st.markdown(
                 '<div class="xg-success">Your analysis is complete! You can download a detailed PDF '
-                "report with all results, images, and findings.</div>",
+                "report with all results, images, and findings. The PDF is not uploaded to S3.</div>",
                 unsafe_allow_html=True,
             )
 
@@ -780,7 +811,7 @@ elif selected_page == "Report":
                     <div class="xg-h3">Report Includes:</div>
                     <ul class="xg-checks">
                       <li>Original &amp; enhanced images</li>
-                      <li>AI findings and confidence scores</li>
+                      <li>AI findings and raw model scores (not probabilities)</li>
                       <li>Grad-CAM visualizations (where available)</li>
                       <li>Image quality measurements</li>
                       <li>Limitations and disclaimer</li>
@@ -792,11 +823,11 @@ elif selected_page == "Report":
 
     # ---------- Cloud Storage ----------
     with tab_s3:
-        bucket = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_S3_BUCKET") or "xrayguide-ai-bucket"
-        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+        bucket, region = "Not configured", get_s3_region()
 
         stored_files, storage_error = [], None
         try:
+            bucket = get_s3_bucket()
             stored_files = list(list_files() or [])
         except Exception as error:
             storage_error = str(error)
@@ -848,20 +879,24 @@ elif selected_page == "Report":
 # ============================================================
 
 elif selected_page == "Settings":
-    page_header("Settings", "Configure application preferences and model thresholds")
+    page_header("Settings", "Configure display and cloud-storage preferences")
 
-    def _sync_threshold():
-        st.session_state["conf_threshold"] = st.session_state["_conf_widget"]
+    def _sync_score_threshold():
+        st.session_state["score_threshold"] = st.session_state["_score_widget"]
 
     st.slider(
-        "Confidence Threshold",
+        "Raw score display threshold",
         0.0,
         1.0,
-        value=float(st.session_state.get("conf_threshold", 0.3)),
+        value=float(st.session_state.get("score_threshold", 0.3)),
         step=0.05,
-        key="_conf_widget",
-        on_change=_sync_threshold,
+        key="_score_widget",
+        on_change=_sync_score_threshold,
     )
-    st.selectbox("Select Model Architecture", ["TorchXRayVision (ResNet-50)", "DenseNet-121", "EfficientNet-B4"])
-    st.checkbox("Enable Automatic S3 Sync", value=True)
-    st.checkbox("Debug Mode", value=False)
+    st.caption("The threshold only changes score-bar styling; it does not filter results.")
+    st.checkbox(
+        "Automatically sync uploaded images to private S3 storage",
+        key="auto_s3_sync",
+        help="When enabled, newly uploaded images are sent to the configured private S3 bucket.",
+    )
+    st.caption("The model architecture is fixed to the bundled TorchXRayVision DenseNet-121.")

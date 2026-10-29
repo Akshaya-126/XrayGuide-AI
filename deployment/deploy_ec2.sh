@@ -7,5 +7,14 @@ cd "$(dirname "$0")/.."
 docker build -f deployment/Dockerfile -t xrayguide-ai .
 docker stop xrayguide-ai 2>/dev/null || true
 docker rm xrayguide-ai 2>/dev/null || true
-docker run -d --restart unless-stopped --name xrayguide-ai -p 8501:8501 xrayguide-ai
+
+docker_args=(--restart unless-stopped --name xrayguide-ai -p 8501:8501)
+if [[ -n "${S3_BUCKET_NAME:-}" ]]; then
+  docker_args+=(-e S3_BUCKET_NAME)
+fi
+if [[ -n "${AWS_REGION:-}" ]]; then
+  docker_args+=(-e AWS_REGION)
+fi
+
+docker run -d "${docker_args[@]}" xrayguide-ai
 docker ps --filter name=xrayguide-ai

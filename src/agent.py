@@ -227,7 +227,7 @@ def analyze_xray(rgb_image: np.ndarray) -> dict:
         metrics,
         predictions=predictions,
         explanation=explanation,
-        gradcam=gradcam,
+        gradcam=gradcam if gradcam is not None else {"heatmap": None},
     )
 
     # A missing Grad-CAM must not discard valid model outputs.
